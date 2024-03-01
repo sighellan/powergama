@@ -11,6 +11,7 @@ import math
 import powergama.database as db
 import csv
 import pandas as pd
+import sqlite3
 
 class Results(object):
     '''
@@ -1506,7 +1507,8 @@ class Results(object):
                     show_node_labels=False,branch_style='c',latlon=None,
                     timeMaxMin=None,
                     dotsize=40, filter_node=None, filter_branch=None,
-                    draw_par_mer=False,showTitle=True, colors=True):
+                    draw_par_mer=False,showTitle=True, colors=True,
+                    ax=None):
         '''
         Plot results to map
         
@@ -1536,6 +1538,7 @@ class Results(object):
         showTitle : boolean
         colors : boolean
             Whether to use colours or not 
+        ax : axis to plot on, otherwise new axis is generated
         '''
         
         # basemap is only used here, so to allow using powergama without
@@ -1545,7 +1548,10 @@ class Results(object):
         if timeMaxMin is None:
             timeMaxMin = [self.timerange[0],self.timerange[-1]+1]
 
-        plt.figure()
+        if ax is None:
+            plt.figure()
+        else:
+            plt.sca(ax)
         data = self.grid
         #res = self
         
@@ -1778,6 +1784,10 @@ class Results(object):
         elif nodetype=='loadshedding':
             node_value = self.getLoadsheddingPerNode(timeMaxMin)
             node_label = 'Loadshedding'
+            node_colormap = cm.hot
+        elif nodetype=='unusedpower':
+            node_value = self.getUnusedPowerPerNode(timeMaxMin)
+            node_label = 'Unused power'
             node_colormap = cm.hot
         else:
             node_value = 'dimgray'
@@ -2353,7 +2363,76 @@ class Results(object):
         plt.xlim(xmin = -0.5, xmax = mainCount + 0.5)
         plt.xticks(range(mainCount + 1), tickLabel)
    
+
+    def unused_power(self, gridmodel, res_generators, res_storage, res_pumped, timestep):
+    
+        possible_unused_power = {}
+        for gen in range(len(gridmodel.generator)):
+            pmax = gridmodel.generator.iloc[gen]['pmax']
+            output = res_generators[(res_generators['timestep'] == timestep) & (res_generators['indx'] == gen)]['output'].values[0]
+            if gen in gridmodel.getIdxGeneratorsWithPumping():
+                ppump = res_pumped[(res_pumped['timestep'] == timestep) & (res_pumped['indx'] == gen)]['output'].values[0]
+                pumped_in = ppump * gridmodel.generator["pump_efficiency"].iloc[gen] * gridmodel.timeDelta
+            else:
+                pumped_in = 0
+            poss_additional_effect = pmax - output
         
+            inflow_fac = gridmodel.generator.iloc[gen]['inflow_fac']
+            inflow_profile_ref = gridmodel.generator["inflow_ref"].iloc[gen]
+            profile_timestep = gridmodel.profiles[inflow_profile_ref][timestep]
+            
+            energy_in = pmax * inflow_fac * profile_timestep * gridmodel.timeDelta
+            energy_output = output * gridmodel.timeDelta
+            starting_storage = res_storage[(res_storage['timestep'] == timestep-1) & (res_storage['indx'] == gen)]['storage'].values
+            if len(starting_storage) == 0:
+                starting_storage = 0
+            else:
+                starting_storage = starting_storage[0]
+            unused_power = (starting_storage + energy_in + pumped_in - energy_output)/gridmodel.timeDelta
+            if poss_additional_effect == 0:
+                possible_unused_power[gen] = 0
+            else:
+                possible_unused_power[gen] = min(poss_additional_effect, unused_power)
+        return possible_unused_power
+
+    def load_res_table(self, tablename):
+        con = sqlite3.connect(self.db.filename)
+        cur = con.cursor()
+        cur.execute("SELECT * FROM %s " %tablename)
+        rows = cur.fetchall()
+        col_names = [desc[0] for desc in cur.description]
+        df = pd.DataFrame(rows, columns=col_names)
+        return df
+            
+    def getUnusedPowerPerNode(self, timeMaxMin):
+    
+        id_to_indx = {rr[1]['id']: rr[0] for rr in self.grid.node.iterrows()}
+    
+        indx_to_gen = {}
+        for rr in self.grid.generator.iterrows():
+            indx = id_to_indx[rr[1]['node']]
+            gen_id = rr[0]
+            if indx in indx_to_gen:
+                indx_to_gen[indx].append(gen_id)
+            else:
+                indx_to_gen[indx] = [gen_id]
+        
+        assert timeMaxMin[1] - timeMaxMin[0] == 1, 'only single timestep implemented'
+        timestep = timeMaxMin[0]
+        
+
+        
+        res_storage = self.load_res_table('Res_Storage')
+        res_generators = self.load_res_table('Res_Generators')
+        res_pumped = self.load_res_table('Res_Pumping')
+        
+        unused_power_gens = self.unused_power(self.grid, res_generators, res_storage, res_pumped, timestep)
+    
+        unused_power_nodes = np.zeros(len(self.grid.node))
+        for ii in indx_to_gen:
+            for gg in indx_to_gen[ii]:
+                unused_power_nodes[ii] += unused_power_gens[gg]
+        return unused_power_nodes
         
         
         
